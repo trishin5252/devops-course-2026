@@ -37,7 +37,13 @@ fi
 
 command -v curl >/dev/null || die 'curl is required for the HTTPS check'
 [[ -r "$CA_CERT" ]] || die "Trusted certificate is not readable: ${CA_CERT}"
-if ! curl --fail --silent --show-error --max-time 10 --cacert "$CA_CERT" --output /dev/null "$SITE_URL"; then
+curl_args=(--fail --silent --show-error --max-time 10 --cacert "$CA_CERT" --output /dev/null)
+# Optional transport override for a local VirtualBox NAT forward under VPN.
+# The URL, Host header and certificate name remain devops.local; TLS stays verified.
+if [[ -n "${DEPLOY_CONNECT_TO:-}" ]]; then
+    curl_args+=(--connect-to "$DEPLOY_CONNECT_TO")
+fi
+if ! curl "${curl_args[@]}" "$SITE_URL"; then
     die 'HTTPS availability or certificate validation failed after synchronization'
 fi
 printf 'Deployed commit %s; HTTPS check passed\n' "$COMMIT"

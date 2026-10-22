@@ -160,7 +160,57 @@ DST=10.0.2.15 (гость), PROTO=TCP, DPT=8080 (порт назначения).
 смену гостевого порта проброса, UFW и hostname. Образ ISO уже не требуется.
 Файлы Windows, ключи и hosts снимком виртуальной машины не откатываются.
 
-## 8. Имя узла и особенность сети Windows
+## 8. Веб-сервер
+
+Установлены пакеты `nginx` (Ubuntu 1.24.0) и `rsync`.
+Главный процесс Nginx — root, рабочие — www-data.
+Ресурс описан в `/etc/nginx/sites-available/devops-site`, активируется
+ссылкой `/etc/nginx/sites-enabled/devops-site`. Ссылка `default` отключена,
+исходный `/etc/nginx/sites-available/default` сохранён.
+
+Каталог `/var/www/devops-site` принадлежит devops:devops, каталоги имеют
+права 755, файлы 644. www-data читает файлы и не может менять содержимое.
+Сначала опубликована временная страница `devops.local: placeholder`.
+Итоговые HTML-файлы подготовлены в `site/` ветки `feature/web-deploy`;
+их доставка с Windows через WSL1 и rsync пока ожидает включения WSL.
+
+Самоподписанный RSA2048 сертификат выпущен на 365 дней командой:
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj '/CN=devops.local' \
+  -addext 'subjectAltName=DNS:devops.local'
+sudo chown root:root /etc/ssl/private/devops.key /etc/ssl/certs/devops.crt
+sudo chmod 600 /etc/ssl/private/devops.key
+sudo chmod 644 /etc/ssl/certs/devops.crt
+```
+
+Закрытый ключ остаётся только на сервере; копировать его в Git запрещено.
+Публичный сертификат получен по проверенному SSH-каналу в `~/devops.crt`
+на Windows. Срок: 22.10.2026 11:24:37 UTC — 22.10.2027 11:24:37 UTC.
+Subject и issuer совпадают; SAN содержит DNS:devops.local.
+
+HTTP80 возвращает 301 с `Location: https://devops.local/`.
+HTTPS443 использует TLS1.2 и TLS1.3. HSTS для учебного сертификата не задан.
+В блоке HTTPS сохранены root, index, try_files, error_page и отдельные
+журналы `/var/log/nginx/devops-site.access.log` и `devops-site.error.log`.
+После изменения конфигурации выполняется только:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Из-за VPN предварительная клиентская проверка Windows выполнена через
+временные NAT-пробросы 127.0.0.1:18080→80 и 127.0.0.1:18443→443
+с `curl --connect-to`, сохраняющим настоящее имя devops.local в запросе
+и проверке TLS. Без доверенного сертификата curl завершился с кодом60
+SEC_E_UNTRUSTED_ROOT; с `--cacert ~/devops.crt` — 200 OK без `-k`.
+Это не заменяет будущую прямую проверку Host-only и скриншоты браузера.
+Временные пробросы удаляются перед снимком 04-nginx-https.
+
+## 9. Имя узла и особенность сети Windows
 
 Внутри Ubuntu выполнены:
 
@@ -190,9 +240,10 @@ Find-NetRoute выбирает Ethernet 2 (Host-only). При активном V
 Блокировка 8080 подтверждена через NAT, как описано в разделе 6;
 отдельный успешный опыт блокировки через Host-only не зафиксирован.
 
-## 9. Скрипт аудита
+## 10. Скрипт аудита
 
-Файл `scripts/audit.sh` выполняет шесть проверок. Запускать на сервере:
+В ПР5 файл `scripts/audit.sh` выполнял шесть проверок SSH и UFW.
+В ПР6 добавлены четыре проверки веб-сервера, всего десять. Запускать на сервере:
 
 ```bash
 bash scripts/audit.sh
@@ -204,3 +255,24 @@ echo $?
 После опыта восстановлено MaxAuthTries 3, повторная проверка завершилась
 кодом 0. Запуск sshd с неверным лимитом для этой проверки не требовался:
 скрипт анализирует эффективную конфигурацию через `sshd -T`.
+
+Раздел веб-сервера проверяет активность nginx, успешность nginx -t,
+срок сертификата не менее 30 дней, а также совместное условие: нет путей
+с записью для всех и режим закрытого ключа равен 600.
+Проверены 10 PASS/0 FAIL/exit0 и два отрицательных опыта:
+`CERT_MIN_DAYS=400 bash /home/devops/audit.sh` даёт 9 PASS/1 FAIL/exit1;
+временные права 666 у index.html дают 9 PASS/1 FAIL/exit1.
+Права восстановлены в 644, окончательный аудит — 10 PASS/0 FAIL/exit0.
+
+## 11. Подготовленный сценарий деплоя
+
+В ветке feature/web-deploy подготовлен `scripts/deploy.sh`.
+Он вычисляет корень репозитория относительно своего пути, проверяет наличие
+site/index.html и чистоту Git, выполняет ровно один rsync по SSH с
+BatchMode=yes и ConnectTimeout=5, --delete и --chmod=D755,F644.
+При --dry-run не изменяет ресурс и не запускает HTTP-проверку.
+Обычный запуск проверяет https://devops.local с ~/devops.crt без -k
+и выводит короткий хеш только при успехе. Для shell-файлов .gitattributes
+закрепляет окончания строк LF.
+Полные пять сценариев проверки пока не выполнены: на Windows требуется
+включить WSL1, перезагрузить компьютер и установить rsync в Linux-окружении.

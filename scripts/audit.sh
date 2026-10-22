@@ -61,5 +61,18 @@ if WORLD_WRITABLE=$(find /var/www/devops-site -perm -o+w -print 2>/dev/null) &&
 fi
 check 'No world-writable site paths and TLS key mode 600' safe "$WEB_PERMISSIONS"
 
+echo '[5] Containerization'
+check 'Docker service is active' active "$(systemctl is-active docker || true)"
+DB_HEALTH=$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null || true)
+check 'PostgreSQL container is healthy' healthy "$DB_HEALTH"
+PRIVATE_PORTS=no
+if SOCKETS=$(ss -H -tln 2>/dev/null); then
+    if awk '$4 ~ /:(5000|5432)$/ && $4 !~ /^127\.0\.0\.1:/ {bad=1} END {exit bad}' <<< "$SOCKETS"; then
+        PRIVATE_PORTS=yes
+    fi
+fi
+check 'Ports 5000 and 5432 listen only on loopback if present' yes "$PRIVATE_PORTS"
+check 'App environment file mode is 600' 600 "$(stat -c '%a' /home/devops/app/.env 2>/dev/null || true)"
+
 printf 'Passed: %s, failed: %s\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

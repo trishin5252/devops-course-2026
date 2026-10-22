@@ -156,6 +156,10 @@ DST=10.0.2.15 (гость), PROTO=TCP, DPT=8080 (порт назначения).
    проверен; UFW и окончательное доменное имя настраивались после снимка.
 4. `04-nginx-https` — Nginx, HTTP301, HTTPS с SAN, ключ root600,
    временная страница и расширенный аудит. Снимок создан до доставки site/.
+5. `05-docker-compose` — Docker Engine и Compose, приложение и PostgreSQL,
+   файл .env только на сервере, именованный том и приватный порт5000.
+   В фактическом снимке также сохранены /app/ в Nginx и расширенный аудит.
+   Создан на корректно выключенной машине; после запуска службы проверены.
 
 Перед проверкой восстановления ПР5 дополнительно сохранён снимок
 `pr6-before-recovery`. Восстановление из 01-clean-install с повторной
@@ -228,7 +232,97 @@ Server nginx/1.24.0 (Ubuntu), Content-Type text/html, Content-Length 424.
 Пробросы удалялись перед 04-nginx-https, затем временно добавлялись
 для тестов WSL под VPN и удаляются после завершения этих тестов.
 
-## 9. Имя узла и особенность сети Windows
+## 9. Контейнеризация
+
+Docker Engine Community 29.9.2 установлен из официального APT-репозитория
+https://download.docker.com/linux/ubuntu для Ubuntu noble, ключ расположен
+в /etc/apt/keyrings/docker.asc, источник — /etc/apt/sources.list.d/docker.sources.
+Установлены docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin
+и docker-compose-plugin (Compose v5.6.1). Пакет docker.io не используется.
+
+Установка воспроизводится по https://docs.docker.com/engine/install/ubuntu/:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod 644 /etc/apt/keyrings/docker.asc
+printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: noble\nComponents: stable\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/docker.asc\n' | sudo tee /etc/apt/sources.list.d/docker.sources
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker devops
+```
+
+После добавления в группу необходимо новое SSH-соединение.
+В группе docker состоит только devops, у которого уже есть sudo.
+Доступ к Docker socket фактически даёт возможности root, а не обычные
+ограниченные права контейнерного приложения. Проверка без sudo:
+`docker run --rm hello-world`, `docker version`, `docker compose version`.
+
+Исходники лежат в app/ репозитория. Серверный проект — /home/devops/app,
+Compose project name по имени каталога — app. Доставка из WSL:
+
+```bash
+rsync -avz --delete --exclude=.env --chmod=D755,F644 --dry-run app/ devops:app/
+rsync -avz --delete --exclude=.env --chmod=D755,F644 app/ devops:app/
+```
+
+Режимы нормализованы для файлов на /mnt/c. Исключение .env обязательно:
+секрет создаётся только на сервере, а --delete не должен его удалять.
+В Git и контекст Docker .env не входит. При восстановлении создаётся новый
+случайный пароль, который не нужно печатать или копировать в Windows:
+
+```bash
+cd ~/app
+umask 077
+password=$(openssl rand -hex 16)
+printf 'POSTGRES_DB=app\nPOSTGRES_USER=app\nPOSTGRES_PASSWORD=%s\nDB_HOST=db\n' "$password" > .env
+unset password
+chmod 600 .env
+docker compose up -d --build --wait --wait-timeout 120
+```
+
+Этот блок создания .env выполняется только при отсутствии существующего файла:
+замена пароля при уже существующем томе сама по себе не меняет пароль в БД.
+Итоговый /home/devops/app/.env принадлежит devops, права 600.
+База postgres:16-alpine хранит данные в томе app_db_data
+(/var/lib/postgresql/data), доступна приложению по DNS-имени db
+в сети app_backend. Порт 5432 не опубликован. Gunicorn слушает 5000
+в контейнере от пользователя app (UID 999), на хост опубликован только
+127.0.0.1:5000:5000. depends_on/service_healthy ждёт pg_isready.
+
+Внутри HTTPS-блока /etc/nginx/sites-available/devops-site добавлено:
+
+```nginx
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Статический location / сохранён. Конфигурация проверяется nginx -t
+и применяется reload. /app/health передаётся как /health за счёт слеша
+в proxy_pass. Проверки через HTTPS выполняются с --cacert, не с -k.
+
+Эксперименты: отдельный app-test без БД дал health200/root500 и
+ошибку localhost:5432; изменение только app.py повторно использовало
+слои установки зависимостей. Счётчик 4 до down стал 5 после запуска;
+после намеренного down -v только нового учебного тома начал с 1.
+Новый итоговый том сохранён. На рабочей БД down -v недопустим.
+При остановке app получен502 и connect() failed111 в Nginx; app восстановлен.
+Временная публикация 5000 на всех адресах дала аудит13/1/exit1,
+возврат127.0.0.1 восстановил14/0/exit0.
+Временный exposed5001 продемонстрировал DNAT Docker и доступ с Windows
+через временный NAT18501 при отсутствии правила UFW; контейнер и проброс
+удалены. Прямая проверка Host-only при включённом VPN не прошла
+и требует отдельной проверки пользователем, не считается успешной.
+
+## 10. Имя узла и особенность сети Windows
 
 Внутри Ubuntu выполнены:
 
@@ -258,7 +352,7 @@ Find-NetRoute выбирает Ethernet 2 (Host-only). При активном V
 Блокировка 8080 подтверждена через NAT, как описано в разделе 6;
 отдельный успешный опыт блокировки через Host-only не зафиксирован.
 
-## 10. Скрипт аудита
+## 11. Скрипт аудита
 
 В ПР5 файл `scripts/audit.sh` выполнял шесть проверок SSH и UFW.
 В ПР6 добавлены четыре проверки веб-сервера, всего десять. Запускать на сервере:
@@ -282,7 +376,12 @@ echo $?
 временные права 666 у index.html дают 9 PASS/1 FAIL/exit1.
 Права восстановлены в 644, окончательный аудит — 10 PASS/0 FAIL/exit0.
 
-## 11. Подготовленный сценарий деплоя
+В ПР7 добавлен раздел [5] с четырьмя проверками Docker, здоровья БД,
+приватной публикации портов5000/5432 и режима .env600.
+Нормальное состояние —14PASS/0FAIL/exit0. Публикация5000на всех адресах
+вызывает13PASS/1FAIL/exit1,после восстановления127.0.0.1сноваexit0.
+
+## 12. Подготовленный сценарий деплоя
 
 В ветке feature/web-deploy подготовлен `scripts/deploy.sh`.
 Он вычисляет корень репозитория относительно своего пути, проверяет наличие
@@ -314,7 +413,7 @@ DEPLOY_CONNECT_TO=devops.local:443:127.0.0.1:18443 bash scripts/deploy.sh
 SSH-мультиплексирование в конфигурации WSL уменьшает частоту соединений
 и не ослабляет серверное правило UFW LIMIT.
 
-## 12. Подготовка WSL1 и результаты диагностики
+## 13. Подготовка WSL1 и результаты диагностики
 
 В Windows включена только Microsoft-Windows-Subsystem-Linux, выполнена
 перезагрузка. `wsl --set-default-version 1`. Официальный Ubuntu22.04 rootfs
@@ -343,5 +442,6 @@ HTTP / → 301. На момент снимка журнал содержал 20 
 3 ответа 403 и 1 ответ 301; счётчик включает прежние эксперименты.
 Адрес 10.0.2.2 в этих записях соответствует NAT, не Host-only.
 Клиент curl/7.81.0, время с зоной +0300; код и размер тела — поля 9 и 10.
-Браузерные скриншоты по devops.local пользователь выполняет позже,
-когда сможет временно отключить VPN. Эти проверки пока не заявлены.
+Прямая браузерная проверка ПР6 по devops.local выполнена пользователем
+с отключённым VPN: главная страница,404,самоподписанный сертификат и SAN.
+Они включены в отчёт ПР6. Для приложения ПР7 нужны отдельные новые кадры.

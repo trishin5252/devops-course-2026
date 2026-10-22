@@ -37,5 +37,29 @@ check 'Default incoming policy is deny' deny "$(sed -n 's/^Default: \([^ ]*\) (i
 
 echo '[3] User accounts'
 awk -F: '$3 >= 1000 && $3 < 65534 {printf "    %s (uid=%s)\n", $1, $3}' /etc/passwd
+
+echo '[4] Web server'
+check 'Nginx service is active' active "$(systemctl is-active nginx || true)"
+NGINX_SYNTAX=no
+if sudo nginx -t >/dev/null 2>&1; then NGINX_SYNTAX=yes; fi
+check 'Nginx configuration is valid' yes "$NGINX_SYNTAX"
+
+CERT_MIN_DAYS="${CERT_MIN_DAYS:-30}"
+case "$CERT_MIN_DAYS" in
+    ''|*[!0-9]*) printf 'Invalid CERT_MIN_DAYS\n' >&2; exit 1 ;;
+esac
+[[ ${#CERT_MIN_DAYS} -le 5 && "$CERT_MIN_DAYS" -le 36500 ]] || { printf 'CERT_MIN_DAYS is too large\n' >&2; exit 1; }
+CERT_OK=no
+if openssl x509 -in /etc/ssl/certs/devops.crt -noout -checkend "$((10#$CERT_MIN_DAYS * 86400))" >/dev/null 2>&1; then CERT_OK=yes; fi
+check "Certificate valid for at least ${CERT_MIN_DAYS} days" yes "$CERT_OK"
+
+WEB_PERMISSIONS=unsafe
+if WORLD_WRITABLE=$(find /var/www/devops-site -perm -o+w -print 2>/dev/null) &&
+   [[ -z "$WORLD_WRITABLE" ]] &&
+   [[ "$(sudo stat -c '%a' /etc/ssl/private/devops.key 2>/dev/null)" == 600 ]]; then
+    WEB_PERMISSIONS=safe
+fi
+check 'No world-writable site paths and TLS key mode 600' safe "$WEB_PERMISSIONS"
+
 printf 'Passed: %s, failed: %s\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
